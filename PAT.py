@@ -16,7 +16,7 @@ from PySide6.QtGui import QFont, QFontDatabase
 #Paths
 BASE_DIRECTORY   = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIRECTORY = os.path.join(BASE_DIRECTORY, "Assets")
-FONT_NAME = "Orbitron-VariableFont_wght.ttf"
+FONT_NAME = "Assets/Orbitron-VariableFont_wght.ttf"
 FONT_PATH = (
     os.path.join(ASSETS_DIRECTORY, FONT_NAME)
     if os.path.exists(os.path.join(ASSETS_DIRECTORY, FONT_NAME))
@@ -293,7 +293,7 @@ class PATMainLayout(QMainWindow):
             if font_id != -1
             else []
         )
-        self.ff = font_families[0] if font_families else "Courier New"
+        self.ff = font_families[0]
         self._build()
 
     def _build(self):
