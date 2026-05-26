@@ -229,30 +229,32 @@ def rightHandSideColumn(ff):
     #Avionics Status Grid
     column.addWidget(sectionPillLabel("Avionics Status", ff))
     AVIONICS_FIELDS = [
-        ("GPS Fix",      "---"), ("GPS Valid",    "---"),
-        ("GPS Speed",    "---"), ("GPS Heading",  "---"),
-        ("Accel X",      "---"), ("Accel Y",      "---"),
-        ("Accel Z",      "---"), ("Gyro X",       "---"),
-        ("Gyro Y",       "---"), ("Gyro Z",       "---"),
-        ("Mag X",        "---"), ("Mag Y",        "---"),
-        ("Mag Z",        "---"), ("IMU Temp",     "---"),
-        ("BMP Temp",     "---"), ("BMP Pressure", "---"),
+        ("GPS Fix",      "gpsFixMillis",  "ms"),   ("GPS Valid",    "gpsValid",     ""),
+        ("GPS Speed",    "gpsSpeed",      "m/s"),   ("GPS Heading",  "gpsHeading",   "°"),
+        ("Accel X",      "accelX",        "g"),     ("Accel Y",      "accelY",       "g"),
+        ("Accel Z",      "accelZ",        "g"),     ("Gyro X",       "gyroX",        "°/s"),
+        ("Gyro Y",       "gyroY",         "°/s"),   ("Gyro Z",       "gyroZ",        "°/s"),
+        ("Mag X",        "magX",          "raw"),   ("Mag Y",        "magY",         "raw"),
+        ("Mag Z",        "magZ",          "raw"),   ("IMU Temp",     "imuTemp",      "°C"),
+        ("BMP Temp",     "bmpTemp",       "°C"),    ("BMP Pressure", "bmpPressure",  "hPa"),
     ]
     avionicsGrid = QGridLayout()
     avionicsGrid.setSpacing(3)
+    avionicsValueLabels = {}
     avionicsGrid.setContentsMargins(4, 4, 4, 4)
-    for index, (name, value) in enumerate(AVIONICS_FIELDS):
+    for index, (name, csvKey, unit) in enumerate(AVIONICS_FIELDS):
         row, columnOffset = divmod(index, 2)
         nameLabel = QLabel(f"{name}:")
         nameLabel.setFont(QFont(ff, 8, QFont.Weight.Bold))
         nameLabel.setStyleSheet(f"color: {BLUE};")
-        valueLabel = QLabel(value)
+        valueLabel = QLabel("---")
         valueLabel.setFont(QFont(ff, 8))
         valueLabel.setStyleSheet("color: #555;")
         valueLabel.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         base = columnOffset * 2
         avionicsGrid.addWidget(nameLabel,  row, base)
         avionicsGrid.addWidget(valueLabel, row, base + 1)
+        avionicsValueLabels[csvKey] = (valueLabel, unit)
     avionicsWidget = QWidget()
     avionicsWidget.setLayout(avionicsGrid)
     avionicsWidget.setStyleSheet(f"background-color: {PANEL}; border-radius: 6px;")
@@ -260,7 +262,7 @@ def rightHandSideColumn(ff):
     avionicsWidget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
     column.addWidget(avionicsWidget, stretch=1)
 
-    return column
+    return column, avionicsValueLabels
 
 
 def playBackBar(ff):
@@ -374,7 +376,7 @@ class PATMainLayout(QMainWindow):
 
         leftLayout, self.topCombo, self.topPlot, self.bottomCombo, self.bottomPlot = leftHandSide2DColumn(self.ff)
         middleLayout, self.plot3d = middle3DColumn(self.ff)
-        rightLayout = rightHandSideColumn(self.ff)
+        rightLayout, self.avionicsValueLabels = rightHandSideColumn(self.ff)
 
         self.topCombo.currentTextChanged.connect(self.onTopVariableChanged)
         self.bottomCombo.currentTextChanged.connect(self.onBottomVariableChanged)
@@ -557,6 +559,15 @@ class PATMainLayout(QMainWindow):
         self.labelGPS.setText(f"GPS: {row.get('gpsLatitude', 0):.5f}, {row.get('gpsLongitude', 0):.5f}")
         self.labelSpeed.setText(f"Speed: {row.get('gpsSpeed', 0):.2f} m/s")
 
+        for csvKey, (label, unit) in self.avionicsValueLabels.items():
+            value = row.get(csvKey, None)
+            if value is not None:
+                if unit:
+                    label.setText(f"{value:.4f} {unit}")
+                else:
+                    label.setText(f"{value:.4f}")
+            else:
+                label.setText("---")
         self.topPlot.updatePlot()
         self.bottomPlot.updatePlot()
         if self.playIndex % 5 == 0:
