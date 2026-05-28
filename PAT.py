@@ -15,8 +15,9 @@ import csv
 import time
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton, QSlider, QFrame, QGridLayout, QSizePolicy, QFileDialog)
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QFontDatabase
+from PySide6.QtGui import QFont, QFontDatabase, QImage, QPixmap
 from PySide6.QtCore import Qt, QTimer
+import cv2
 
 #Paths
 BASE_DIRECTORY   = os.path.dirname(os.path.abspath(__file__))
@@ -215,15 +216,27 @@ def rightHandSideColumn(ff):
     column.setContentsMargins(8, 8, 8, 8)
 
     #Camera Feed
-    column.addWidget(sectionPillLabel("Camera Feed", ff))
-    cameraRow = QHBoxLayout()
-    cameraRow.setSpacing(4)
-    cameraRow.addWidget(placeHolderBox("VEGA Computer Vision Feed", minimumHeight=60))
-    cameraRow.addWidget(placeHolderBox("Raw Camera Feed", minimumHeight=60))
-    cameraWidget = QWidget()
-    cameraWidget.setLayout(cameraRow)
-    cameraWidget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-    column.addWidget(cameraWidget, stretch=3)
+    column.addWidget(sectionPillLabel("Onboard Camera Feed", ff))
+    vegaLabel = QLabel("VEGA Rideshare\n\n(Load a video to begin)")
+    vegaLabel.setAlignment(Qt.AlignCenter)
+    vegaLabel.setStyleSheet(
+        "background-color: #1a1a2e; color: #aab2d0; "
+        f"border: 1px solid {BLUE}; border-radius: 6px; font-size: 11px;"
+    )
+    vegaLabel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+    vegaLabel.setMinimumHeight(80)
+
+    rawVideoLabel = QLabel("🎥  Raw Camera Feed\n\n(Load a video to begin)")
+    rawVideoLabel.setAlignment(Qt.AlignCenter)
+    rawVideoLabel.setStyleSheet(
+        "background-color: #1a1a2e; color: #aab2d0; "
+        f"border: 1px solid {BLUE}; border-radius: 6px; font-size: 11px;"
+    )
+    rawVideoLabel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+    rawVideoLabel.setMinimumHeight(80)
+
+    column.addWidget(vegaLabel, stretch=1)
+    column.addWidget(rawVideoLabel, stretch=1)
     column.addWidget(heightSplitter())
 
     #Avionics Status Grid
@@ -262,7 +275,7 @@ def rightHandSideColumn(ff):
     avionicsWidget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
     column.addWidget(avionicsWidget, stretch=1)
 
-    return column, avionicsValueLabels
+    return column, avionicsValueLabels, vegaLabel, rawVideoLabel
 
 
 def playBackBar(ff):
@@ -325,7 +338,7 @@ def playBackBar(ff):
     layout.addWidget(timeLabel)
     layout.addWidget(progressLabel)
 
-    return bar, buttonCSV, buttonReset, buttonPlay, playBackSpeedCombo, playBackSlider, timeLabel, progressLabel
+    return bar, buttonCSV, buttonVEGA, buttonRaw, buttonReset, buttonPlay, playBackSpeedCombo, playBackSlider, timeLabel, progressLabel
 
 
 def avionicsStatusGrid(ff):
@@ -376,18 +389,19 @@ class PATMainLayout(QMainWindow):
 
         leftLayout, self.topCombo, self.topPlot, self.bottomCombo, self.bottomPlot = leftHandSide2DColumn(self.ff)
         middleLayout, self.plot3d = middle3DColumn(self.ff)
-        rightLayout, self.avionicsValueLabels = rightHandSideColumn(self.ff)
-
+        rightLayout, self.avionicsValueLabels, self.vegaLabel, self.rawVideoLabel = rightHandSideColumn(self.ff)
         self.topCombo.currentTextChanged.connect(self.onTopVariableChanged)
         self.bottomCombo.currentTextChanged.connect(self.onBottomVariableChanged)
 
-        (playBar, self.buttonCSV, self.buttonReset, self.buttonPlay, self.playBackSpeedCombo, self.playBackSlider, self.timeLabel, self.progressLabel) = playBackBar(self.ff)
+        (playBar, self.buttonCSV, self.buttonVEGA, self.buttonRaw, self.buttonReset, self.buttonPlay, self.playBackSpeedCombo, self.playBackSlider, self.timeLabel, self.progressLabel) = playBackBar(self.ff)
 
         self.buttonCSV.clicked.connect(self.onLoadCSV)
         self.buttonPlay.clicked.connect(self.onPlay)
         self.buttonReset.clicked.connect(self.onRestart)
         self.playBackSpeedCombo.currentIndexChanged.connect(self.onPlayBackSpeedChanged)
         self.playBackSlider.sliderMoved.connect(self.onSliderMoved)
+        self.buttonVEGA.clicked.connect(self.onLoadVegaVideo)
+        self.buttonRaw.clicked.connect(self.onLoadRawVideo)
 
         #Playback state
         self.allRows   = []
@@ -398,6 +412,12 @@ class PATMainLayout(QMainWindow):
         self.startIndex = 0
         PLAYBACK_SPEEDS = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
         self.playbackSpeeds = PLAYBACK_SPEEDS
+
+        self.capVega  = None
+        self.capRawVideo = None
+        self.videoTimer = QTimer()
+        self.videoTimer.timeout.connect(self.onVideoTick)
+        self.videoTimer.start(33)
 
         self.statusStrip = avionicsStatusGrid(self.ff)
         statusWidgets = []
@@ -482,6 +502,11 @@ class PATMainLayout(QMainWindow):
         self.plot3d.positionX.clear()
         self.plot3d.positionY.clear()
         self.plot3d.positionZ.clear()
+
+        if self.capVega and self.capVega.isOpened():
+            self.capVega.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        if self.capRawVideo and self.capRawVideo.isOpened():
+            self.capRawVideo.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     def onPlayBackSpeedChanged(self, index):
         if self.playing:
@@ -582,6 +607,79 @@ class PATMainLayout(QMainWindow):
             self.playing = False
             self.buttonPlay.setText("Play")
             self.labelStatus.setText("Status: Complete")
+    
+    def onLoadVegaVideo(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open CV Video", BASE_DIRECTORY,
+            "Video Files (*.mp4 *.avi *.h264 *.mkv *.mov)"
+        )
+        if not path:
+            return
+        if self.capVega:
+            self.capVega.release()
+        self.capVega = cv2.VideoCapture(path)
+        if not self.capVega.isOpened():
+            self.vegaLabel.setText("VEGA Rideshare Feed\n\n(Could not open file)")
+    
+    def onLoadRawVideo(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Raw Video", BASE_DIRECTORY,
+            "Video Files (*.mp4 *.avi *.h264 *.mkv *.mov)"
+        )
+        if not path:
+            return
+        if self.capRawVideo:
+            self.capRawVideo.release()
+        self.capRawVideo = cv2.VideoCapture(path)
+        if not self.capRawVideo.isOpened():
+            self.rawVideoLabel.setText("Raw Camera Feed\n\n(Could not open file)")  
+
+    def onVideoTick(self):
+        if not self.playing or not self.allRows:
+            return
+        row     = self.allRows[self.playIndex]
+        t       = row["millis"] / 1000.0 - self.allRows[0]["millis"] / 1000.0
+        tTotal  = (self.allRows[-1]["millis"] - self.allRows[0]["millis"]) / 1000.0
+        if tTotal <= 0:
+            return
+        fraction = t / tTotal
+
+        self._updateFrame(self.capVega,     self.vegaLabel,     fraction)
+        self._updateFrame(self.capRawVideo, self.rawVideoLabel, fraction)
+
+    def _updateFrame(self, cap, label, fraction):
+        if cap is None or not cap.isOpened():
+            return
+
+        totalFrames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+
+        if totalFrames > 0:
+            targetFrame = int(fraction * totalFrames)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, targetFrame)
+        elif fps > 0:
+            totalDuration = cap.get(cv2.CAP_PROP_POS_AVI_RATIO)
+            tTotal = self.allRows[-1]["millis"] / 1000.0 - self.allRows[0]["millis"] / 1000.0
+            targetMs = fraction * tTotal * 1000.0
+            cap.set(cv2.CAP_PROP_POS_MSEC, targetMs)
+        else:
+            pass
+
+        returnValue, frame = cap.read()
+        if not returnValue:
+            return
+        labelWidth  = label.width()
+        labelHeight = label.height()
+        if labelWidth < 10 or labelHeight < 10:
+            return
+        height, width = frame.shape[:2]
+        scale     = min(labelWidth / width, labelHeight / height)
+        newWidth  = int(width  * scale)
+        newHeight = int(height * scale)
+        frame = cv2.resize(frame, (newWidth, newHeight), interpolation=cv2.INTER_AREA)
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = QImage(frame.data, newWidth, newHeight, newWidth * 3, QImage.Format_RGB888)
+        label.setPixmap(QPixmap.fromImage(image))
 
 
 if __name__ == "__main__":
