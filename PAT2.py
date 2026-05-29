@@ -15,25 +15,26 @@ import math
 import threading
 import urllib.request
 from http.server import HTTPServer, SimpleHTTPRequestHandler
-
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QLabel, QComboBox, QPushButton, 
-                             QSlider, QFrame, QGridLayout, QSizePolicy)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton, QSlider, QFrame, QGridLayout, QSizePolicy, QFileDialog)
 from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QFont, QFontDatabase
+from PySide6.QtGui import QFont, QFontDatabase, QImage, QPixmap
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
-# ================= CONFIG & ENVIRONMENT =================
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIRECTORY = BASE_DIR  
-
 ASSETS_DIRECTORY = os.path.join(BASE_DIR, "Assets")
 TILE_DIR = os.path.join(BASE_DIR, "tiles")
-
-# Handle font settings safely
+LEAFLET_ASSETS = {
+    "leaflet.css": "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css",
+    "leaflet.js": "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js",
+}
 FONT_NAME = "Orbitron-VariableFont_wght.ttf"
 FONT_PATH = (
     os.path.join(ASSETS_DIRECTORY, FONT_NAME)
@@ -43,12 +44,12 @@ FONT_PATH = (
 
 os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu"
 
-# University of Liverpool EEE Building Coordinates
+#University of Liverpool EEE Building Coordinates
 LAUNCH_LAT = 53.4065
 LAUNCH_LON = -2.9665
 SIM_DT = 0.03
 
-# ================= UI COLOR SCHEME =================
+#Colour Scheme
 BLUE   = "#212b58"
 PANEL  = "#f0f2f7"
 WHITE  = "#ffffff"
@@ -73,15 +74,20 @@ BUTTON_PLAY = (
     "QPushButton:hover { background-color: #f0f2f7; }"
 )
 
-# ================= TILE SERVER =================
+#Tile Server
+class QuietHTTPRequestHandler(SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+
 def start_tile_server():
     os.chdir(BASE_DIR)
-    server = HTTPServer(("127.0.0.1", 8000), SimpleHTTPRequestHandler)
+    server = HTTPServer(("127.0.0.1", 8000), QuietHTTPRequestHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     print("🌐 Server running at http://127.0.0.1:8000")
 
-# ================= TILE DOWNLOAD SYSTEM =================
+#Tile Download
 def deg2tile(lat, lon, z):
     n = 2 ** z
     x = int((lon + 180.0) / 360.0 * n)
@@ -121,7 +127,31 @@ def ensure_tiles():
                 download_tile(z, cx + dx, cy + dy)
     print("✅ Tiles synchronized offline")
 
-# ================= LEAFLET HTML STRATEGY (OPTION A) =================
+def ensure_leaflet_assets():
+    missing_assets = [
+        (filename, url)
+        for filename, url in LEAFLET_ASSETS.items()
+        if not os.path.exists(os.path.join(BASE_DIR, filename))
+    ]
+    if not missing_assets:
+        return
+
+    print("📦 Downloading missing Leaflet assets...")
+    for filename, url in missing_assets:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "QtRocketSim/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=8) as response:
+                data = response.read()
+            with open(os.path.join(BASE_DIR, filename), "wb") as f:
+                f.write(data)
+        except Exception as exc:
+            print(f"⚠️ Could not download {filename}: {exc}")
+    print("✅ Leaflet assets synchronized offline")
+
+#Leaflet HTML
 HTML = f"""
 <!DOCTYPE html>
 <html>
@@ -175,30 +205,59 @@ var rocket = L.marker([LAUNCH_LAT, LAUNCH_LON], {{
 
 var path = L.polyline([], {{color: '#212b58', weight: 3.5}}).addTo(map);
 
-window.updateMarker = function(lat, lon) {{
-    rocket.setLatLng([lat, lon]);
-    path.addLatLng([lat, lon]);
-    
-    var dist = Math.sqrt(Math.pow(lat - LAUNCH_LAT, 2) + Math.pow(lon - LAUNCH_LON, 2));
-    
-    if (dist > 0.0001) {{
-        map.fitBounds(L.latLngBounds([[LAUNCH_LAT, LAUNCH_LON], [lat, lon]]).pad(0.3));
-    }} else {{
-        map.setView([LAUNCH_LAT, LAUNCH_LON], 14);
+function applyPositions(coords, replacePath) {{
+    if (!Array.isArray(coords) || coords.length === 0) {{
+        if (replacePath) {{
+            path.setLatLngs([]);
+            rocket.setLatLng([LAUNCH_LAT, LAUNCH_LON]);
+            map.setView([LAUNCH_LAT, LAUNCH_LON], 14);
+        }}
+        return;
     }}
+
+    if (replacePath) {{
+        path.setLatLngs(coords);
+    }} else {{
+        coords.forEach(function(coord) {{
+            path.addLatLng(coord);
+        }});
+    }}
+
+    var last = coords[coords.length - 1];
+    rocket.setLatLng(last);
+
+    var bounds = path.getBounds();
+    if (bounds.isValid()) {{
+        map.fitBounds(bounds.extend([LAUNCH_LAT, LAUNCH_LON]).pad(0.3));
+    }} else {{
+        map.setView(last, 14);
+    }}
+}}
+
+window.updateMarker = function(lat, lon) {{
+    applyPositions([[lat, lon]], false);
 }};
 
-window.resetMapFramework = function() {{
+window.setPath = function(coords) {{
+    applyPositions(coords, true);
+}};
+
+window.appendPositions = function(coords) {{
+    applyPositions(coords, false);
+}};
+
+window.resetMap = function() {{
     path.setLatLngs([]);
     rocket.setLatLng([LAUNCH_LAT, LAUNCH_LON]);
     map.setView([LAUNCH_LAT, LAUNCH_LON], 14);
 }};
+
+window.resetMapFramework = window.resetMap;
 </script>
 </body>
 </html>
 """
 
-# ================= MATPLOTLIB WIDGETS =================
 class Plot2D(FigureCanvas):
     def __init__(self, title, ylabel):
         self.figure = Figure(tight_layout=True)
@@ -261,7 +320,6 @@ class Plot3D(FigureCanvas):
         self.axis.scatter([self.positionX[-1]], [self.positionY[-1]], [self.positionZ[-1]], s=50, color="red", zorder=5)
         self.draw_idle()
 
-# ================= HELPER FUNCTIONS =================
 def sectionPillLabel(text, ff):
     label = QLabel(text)
     label.setFont(QFont(ff, 8, QFont.Weight.Bold))
@@ -276,21 +334,20 @@ def heightSplitter():
     line.setFixedHeight(2)
     return line
 
-# ================= MAIN APPLICATION FRAME =================
 class MapWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Liverpool Rocket Tracker - Consolidated UI")
+        self.setWindowTitle("PAT")
         self.resize(1280, 800)
 
-        # Main Layout Scaffold
+        #Main Layout Scaffold
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         base_layout = QHBoxLayout(main_widget)
         base_layout.setContentsMargins(10, 10, 10, 10)
         base_layout.setSpacing(10)
 
-        # Left Panel (Telemetry Graphics Dashboard)
+        #Left Panel (Telemetry Graphics Dashboard)
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -304,16 +361,16 @@ class MapWindow(QMainWindow):
         left_layout.addWidget(self.plot3d)
         base_layout.addWidget(left_panel, stretch=1)
 
-        # Right Panel (Geospatial Web Map Frame)
+        #Right Panel (Geospatial Web Map Frame)
         self.view = QWebEngineView()
         self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         base_layout.addWidget(self.view, stretch=2)
 
-        # Mount HTML directly onto local asset server context 
+        #Mount HTML directly onto local asset server context 
         self.view.setHtml(HTML, QUrl("http://127.0.0.1:8000/"))
         self.view.loadFinished.connect(self.handle_load_finished)
 
-        # Data Mechanics Variables
+        #Data Mechanics Variables
         self.data = self.load_csv("test_flight_data.csv")
         self.t = 0.0
         self.i = 0
@@ -329,7 +386,7 @@ class MapWindow(QMainWindow):
         if success:
             QTimer.singleShot(750, self.start)
         else:
-            print("⚠️ Web view failed to reach asset server context.")
+            print("Web view failed to reach asset server context")
 
     def start(self):
         self.timer.start()
@@ -372,11 +429,11 @@ class MapWindow(QMainWindow):
             self.s_lat = self.alpha * lat + (1 - self.alpha) * self.s_lat
             self.s_lon = self.alpha * lon + (1 - self.alpha) * self.s_lon
 
-        # Push coordinate vectors out into the Javascript rendering framework
+        # ush coordinate vectors out into the Javascript rendering framework
         js = f"window.updateMarker({self.s_lat}, {self.s_lon});"
         self.view.page().runJavaScript(js)
 
-        # Mock values generated to sync standard graph displays dynamically alongside maps
+        #Mock values generated to sync standard graph displays dynamically alongside maps
         self.plot2d_1.times.append(self.t)
         self.plot2d_1.values.append(math.sin(self.t * 0.2) * 150 + (self.t * 10))
         self.plot2d_1.updatePlot()
@@ -859,6 +916,9 @@ class PATMainLayout(QMainWindow):
             self.labelStatus.setText("Status: Complete")
     
     def onLoadVegaVideo(self):
+        if cv2 is None:
+            self.vegaLabel.setText("VEGA Rideshare Feed\n\n(OpenCV is not installed)")
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Open CV Video", BASE_DIRECTORY,
             "Video Files (*.mp4 *.avi *.h264 *.mkv *.mov)"
@@ -872,6 +932,9 @@ class PATMainLayout(QMainWindow):
             self.vegaLabel.setText("VEGA Rideshare Feed\n\n(Could not open file)")
     
     def onLoadRawVideo(self):
+        if cv2 is None:
+            self.rawVideoLabel.setText("Raw Camera Feed\n\n(OpenCV is not installed)")
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Raw Video", BASE_DIRECTORY,
             "Video Files (*.mp4 *.avi *.h264 *.mkv *.mov)"
@@ -887,9 +950,9 @@ class PATMainLayout(QMainWindow):
     def onVideoTick(self):
         if not self.playing or not self.allRows:
             return
-        row     = self.allRows[self.playIndex]
-        t       = row["millis"] / 1000.0 - self.allRows[0]["millis"] / 1000.0
-        tTotal  = (self.allRows[-1]["millis"] - self.allRows[0]["millis"]) / 1000.0
+        row = self.allRows[self.playIndex]
+        t = row["millis"] / 1000.0 - self.allRows[0]["millis"] / 1000.0
+        tTotal = (self.allRows[-1]["millis"] - self.allRows[0]["millis"]) / 1000.0
         if tTotal <= 0:
             return
         fraction = t / tTotal
@@ -898,6 +961,8 @@ class PATMainLayout(QMainWindow):
         self._updateFrame(self.capRawVideo, self.rawVideoLabel, fraction)
 
     def _updateFrame(self, cap, label, fraction):
+        if cv2 is None:
+            return
         if cap is None or not cap.isOpened():
             return
 
@@ -931,6 +996,7 @@ class PATMainLayout(QMainWindow):
 
 if __name__ == "__main__":
     os.makedirs(TILE_DIR, exist_ok=True)
+    ensure_leaflet_assets()
     start_tile_server()
     ensure_tiles()
     
