@@ -85,7 +85,7 @@ def start_tile_server():
     server = HTTPServer(("127.0.0.1", 8000), QuietHTTPRequestHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    print("🌐 Server running at http://127.0.0.1:8000")
+    print("Server running at http://127.0.0.1:8000")
 
 #Tile Download
 def deg2tile(lat, lon, z):
@@ -118,14 +118,14 @@ def download_tile(z, x, y):
         pass
 
 def ensure_tiles():
-    print("📦 Downloading missing map tiles...")
+    print("Downloading missing map tiles...")
     for z in range(12, 16):
         cx, cy = deg2tile(LAUNCH_LAT, LAUNCH_LON, z)
         radius = 5
         for dx in range(-radius, radius + 1):
             for dy in range(-radius, radius + 1):
                 download_tile(z, cx + dx, cy + dy)
-    print("✅ Tiles synchronized offline")
+    print("Tiles synchronized offline")
 
 def ensure_leaflet_assets():
     missing_assets = [
@@ -136,7 +136,7 @@ def ensure_leaflet_assets():
     if not missing_assets:
         return
 
-    print("📦 Downloading missing Leaflet assets...")
+    print("Downloading missing Leaflet assets...")
     for filename, url in missing_assets:
         try:
             req = urllib.request.Request(
@@ -148,8 +148,8 @@ def ensure_leaflet_assets():
             with open(os.path.join(BASE_DIR, filename), "wb") as f:
                 f.write(data)
         except Exception as exc:
-            print(f"⚠️ Could not download {filename}: {exc}")
-    print("✅ Leaflet assets synchronized offline")
+            print(f"Could not download {filename}: {exc}")
+    print("Leaflet assets synchronized offline")
 
 #Leaflet HTML
 HTML = f"""
@@ -670,14 +670,38 @@ class PATMainLayout(QMainWindow):
         self._build()
 
     def _build(self):
-        titleBanner = QLabel("PAT - Postflight Analysis Tracker  |  LASER - UnityRise - PL-26")
-        titleBanner.setAlignment(Qt.AlignCenter)
-        titleBanner.setFixedHeight(48)
-        titleBanner.setFont(QFont(self.ff, 15, QFont.Weight.Bold))
-        titleBanner.setStyleSheet(
-            f"background-color: {BLUE}; color: white; "
-            f"border-radius: 10px; padding: 5px; letter-spacing: 1px;"
-        )
+        bannerWidget = QWidget()
+        bannerWidget.setFixedHeight(56)
+        bannerWidget.setStyleSheet(f"background-color: {BLUE}; border-radius: 10px;")
+
+        bannerLayout = QHBoxLayout(bannerWidget)
+        bannerLayout.setContentsMargins(10, 4, 10, 4)
+        bannerLayout.setSpacing(8)
+
+        def makeLogo(path, height=44):
+            label = QLabel()
+            pixmap = QPixmap(path)
+            if not pixmap.isNull():
+                label.setPixmap(pixmap.scaledToHeight(height, Qt.SmoothTransformation))
+            label.setAlignment(Qt.AlignVCenter | Qt.AlignHCenter)
+            label.setStyleSheet("background: transparent;")
+            return label
+
+        laserLogo  = makeLogo(os.path.join(ASSETS_DIRECTORY, "LASER_Logo.png"))
+        unityRiseLogo  = makeLogo(os.path.join(ASSETS_DIRECTORY, "unityrise_logo.png"))
+        uolLogo    = makeLogo(os.path.join(ASSETS_DIRECTORY, "uol_logo.png"))
+
+        titleText = QLabel("PAT - Postflight Analysis Tracker  |  LASER - UnityRise - PL-26")
+        titleText.setAlignment(Qt.AlignCenter)
+        titleText.setFont(QFont(self.ff, 14, QFont.Weight.Bold))
+        titleText.setStyleSheet("color: white; background: transparent; letter-spacing: 1px;")
+
+        bannerLayout.addWidget(laserLogo)
+        bannerLayout.addWidget(unityRiseLogo)
+        bannerLayout.addStretch()
+        bannerLayout.addWidget(titleText)
+        bannerLayout.addStretch()
+        bannerLayout.addWidget(uolLogo)
 
         leftLayout, self.topCombo, self.topPlot, self.bottomCombo, self.bottomPlot = leftHandSide2DColumn(self.ff)
         middleLayout, self.plot3d, self.mapView = middle3DColumn(self.ff)
@@ -735,7 +759,7 @@ class PATMainLayout(QMainWindow):
         rootLayout = QVBoxLayout()
         rootLayout.setSpacing(6)
         rootLayout.setContentsMargins(10, 8, 10, 8)
-        rootLayout.addWidget(titleBanner)
+        rootLayout.addWidget(bannerWidget)
         rootLayout.addLayout(self.statusStrip)
         rootLayout.addLayout(columns, stretch=1)
         rootLayout.addWidget(playBar)
