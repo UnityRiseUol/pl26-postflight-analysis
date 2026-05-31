@@ -9,25 +9,48 @@
 import sys
 import os
 import numpy as np
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
 import csv
 import time
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton, QSlider, QFrame, QGridLayout, QSizePolicy, QFileDialog)
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QFontDatabase, QImage, QPixmap
-from PySide6.QtCore import Qt, QTimer
-import cv2
+import math
+import threading
+import urllib.request
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton, QSlider, QFrame, QGridLayout, QSizePolicy, QFileDialog, QStackedWidget)
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QFont, QFontDatabase, QImage, QPixmap, QQuaternion, QMatrix4x4
+from PySide6.QtWebEngineWidgets import QWebEngineView
+import pyqtgraph.opengl as gl
+from stl import mesh
 
-#Paths
-BASE_DIRECTORY   = os.path.dirname(os.path.abspath(__file__))
-ASSETS_DIRECTORY = os.path.join(BASE_DIRECTORY, "Assets")
-FONT_NAME        = "Orbitron-VariableFont_wght.ttf"
-FONT_PATH        = (
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIRECTORY = BASE_DIR  
+ASSETS_DIRECTORY = os.path.join(BASE_DIR, "Assets")
+TILE_DIR = os.path.join(BASE_DIR, "tiles")
+LEAFLET_ASSETS = {
+    "leaflet.css": "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css",
+    "leaflet.js": "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js",
+}
+FONT_NAME = "Orbitron-VariableFont_wght.ttf"
+FONT_PATH = (
     os.path.join(ASSETS_DIRECTORY, FONT_NAME)
     if os.path.exists(os.path.join(ASSETS_DIRECTORY, FONT_NAME))
-    else os.path.join(BASE_DIRECTORY, FONT_NAME)
+    else os.path.join(BASE_DIR, FONT_NAME)
 )
+
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu"
+
+#University of Liverpool EEE Building Coordinates
+LAUNCH_LAT = 53.4065
+LAUNCH_LON = -2.9665
+SIM_DT = 0.03
 
 #Colour Scheme
 BLUE   = "#212b58"
@@ -54,6 +77,189 @@ BUTTON_PLAY = (
     "QPushButton:hover { background-color: #f0f2f7; }"
 )
 
+#Tile Server
+class QuietHTTPRequestHandler(SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+
+def start_tile_server():
+    os.chdir(BASE_DIR)
+    server = HTTPServer(("127.0.0.1", 8000), QuietHTTPRequestHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print("Server running at http://127.0.0.1:8000")
+
+#Tile Download
+def deg2tile(lat, lon, z):
+    n = 2 ** z
+    x = int((lon + 180.0) / 360.0 * n)
+    y = int((1.0 - math.log(
+        math.tan(math.radians(lat)) +
+        1 / math.cos(math.radians(lat))
+    ) / math.pi) / 2.0 * n)
+    return x, y
+
+def download_tile(z, x, y):
+    path = os.path.join(TILE_DIR, str(z), str(x), f"{y}.png")
+    if os.path.exists(path):
+        return
+
+    url = f"https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "QtRocketSim/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = r.read()
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+    except Exception:
+        pass
+
+def ensure_tiles():
+    print("Downloading missing map tiles...")
+    for z in range(12, 16):
+        cx, cy = deg2tile(LAUNCH_LAT, LAUNCH_LON, z)
+        radius = 5
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                download_tile(z, cx + dx, cy + dy)
+    print("Tiles synchronized offline")
+
+def ensure_leaflet_assets():
+    missing_assets = [
+        (filename, url)
+        for filename, url in LEAFLET_ASSETS.items()
+        if not os.path.exists(os.path.join(BASE_DIR, filename))
+    ]
+    if not missing_assets:
+        return
+
+    print("Downloading missing Leaflet assets...")
+    for filename, url in missing_assets:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "QtRocketSim/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=8) as response:
+                data = response.read()
+            with open(os.path.join(BASE_DIR, filename), "wb") as f:
+                f.write(data)
+        except Exception as exc:
+            print(f"Could not download {filename}: {exc}")
+    print("Leaflet assets synchronized offline")
+
+#Leaflet HTML
+HTML = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<link rel="stylesheet" href="http://127.0.0.1:8000/leaflet.css"/>
+<script src="http://127.0.0.1:8000/leaflet.js"></script>
+<style>
+html, body, #map {{ height: 100%; margin: 0; background-color: #f0f2f7; }}
+.rocket {{
+  width: 14px;
+  height: 14px;
+  background: #00aaff;
+  border-radius: 50%;
+  box-shadow: 0 0 12px #00aaff;
+}}
+.launch {{
+  width: 10px;
+  height: 10px;
+  background: red;
+  border-radius: 50%;
+  box-shadow: 0 0 10px red;
+}}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<script>
+const LAUNCH_LAT = {LAUNCH_LAT};
+const LAUNCH_LON = {LAUNCH_LON};
+
+var map = L.map('map', {{
+    zoomControl: false,
+    attributionControl: false,
+    minZoom: 12,
+    maxZoom: 15
+}}).setView([LAUNCH_LAT, LAUNCH_LON], 14);
+
+L.tileLayer('http://127.0.0.1:8000/tiles/{{z}}/{{x}}/{{y}}.png', {{
+    minZoom: 12,
+    maxZoom: 15
+}}).addTo(map);
+
+var launch = L.marker([LAUNCH_LAT, LAUNCH_LON], {{
+    icon: L.divIcon({{ className: "launch" }})
+}}).addTo(map);
+
+var rocket = L.marker([LAUNCH_LAT, LAUNCH_LON], {{
+    icon: L.divIcon({{ className: "rocket" }})
+}}).addTo(map);
+
+var path = L.polyline([], {{color: '#212b58', weight: 3.5}}).addTo(map);
+
+function applyPositions(coords, replacePath) {{
+    if (!Array.isArray(coords) || coords.length === 0) {{
+        if (replacePath) {{
+            path.setLatLngs([]);
+            rocket.setLatLng([LAUNCH_LAT, LAUNCH_LON]);
+            map.setView([LAUNCH_LAT, LAUNCH_LON], 14);
+        }}
+        return;
+    }}
+
+    if (replacePath) {{
+        path.setLatLngs(coords);
+    }} else {{
+        coords.forEach(function(coord) {{
+            path.addLatLng(coord);
+        }});
+    }}
+
+    var last = coords[coords.length - 1];
+    rocket.setLatLng(last);
+
+    var bounds = path.getBounds();
+    if (bounds.isValid()) {{
+        map.fitBounds(bounds.extend([LAUNCH_LAT, LAUNCH_LON]).pad(0.3));
+    }} else {{
+        map.setView(last, 14);
+    }}
+}}
+
+window.updateMarker = function(lat, lon) {{
+    applyPositions([[lat, lon]], false);
+}};
+
+window.setPath = function(coords) {{
+    applyPositions(coords, true);
+}};
+
+window.appendPositions = function(coords) {{
+    applyPositions(coords, false);
+}};
+
+window.resetMap = function() {{
+    path.setLatLngs([]);
+    rocket.setLatLng([LAUNCH_LAT, LAUNCH_LON]);
+    map.setView([LAUNCH_LAT, LAUNCH_LON], 14);
+}};
+
+window.resetMapFramework = window.resetMap;
+</script>
+</body>
+</html>
+"""
 
 class Plot2D(FigureCanvas):
     def __init__(self, title, ylabel):
@@ -90,20 +296,18 @@ class Plot2D(FigureCanvas):
         self.axis.autoscale_view()
         self.draw_idle()
 
-
 class Plot3D(FigureCanvas):
     def __init__(self):
         self.figure = Figure(tight_layout=True)
         self.axis   = self.figure.add_subplot(111, projection="3d")
-        super().__init__(self.figure)                        # fixed: was self.print_figure
+        super().__init__(self.figure)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.positionX, self.positionY, self.positionZ = [], [], []
         self.figure.patch.set_facecolor(PANEL)
         self._styleAxes()
 
     def _styleAxes(self):
-        self.axis.set_title("Live INS Relative Position (XYZ)", fontsize=9,
-                            fontweight="bold", color=BLUE)
+        self.axis.set_title("Live INS Relative Position (XYZ)", fontsize=9, fontweight="bold", color=BLUE)
         self.axis.set_xlabel("X (m)", fontsize=7)
         self.axis.set_ylabel("Y (m)", fontsize=7)
         self.axis.set_zlabel("Z (m)", fontsize=7)
@@ -115,38 +319,16 @@ class Plot3D(FigureCanvas):
             return
         self.axis.clear()
         self._styleAxes()
-        self.axis.plot(self.positionX, self.positionY, self.positionZ, lw=1.5, color=BLUE)  # fixed: typo posisitonY
-        self.axis.scatter(
-            [self.positionX[-1]], [self.positionY[-1]], [self.positionZ[-1]],
-            s=50, color="red", zorder=5
-        )
+        self.axis.plot(self.positionX, self.positionY, self.positionZ, lw=1.5, color=BLUE)
+        self.axis.scatter([self.positionX[-1]], [self.positionY[-1]], [self.positionZ[-1]], s=50, color="red", zorder=5)
         self.draw_idle()
-
 
 def sectionPillLabel(text, ff):
     label = QLabel(text)
     label.setFont(QFont(ff, 8, QFont.Weight.Bold))
     label.setFixedHeight(20)
-    label.setStyleSheet(
-        f"color: white; background-color: {BLUE}; "
-        f"border-radius: 4px; padding: 1px 8px;"
-    )
+    label.setStyleSheet(f"color: white; background-color: {BLUE}; border-radius: 4px; padding: 1px 8px;")
     return label
-
-
-def placeHolderBox(text, minimumHeight=0):
-    label = QLabel(text)
-    label.setAlignment(Qt.AlignCenter)
-    label.setStyleSheet(
-        f"background-color: {PANEL}; color: #8892b0; "
-        f"border: 1px dashed {BORDER}; border-radius: 6px; "
-        f"font-size: 11px;"
-    )
-    label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-    if minimumHeight:
-        label.setMinimumHeight(minimumHeight)
-    return label
-
 
 def heightSplitter():
     line = QFrame()
@@ -154,6 +336,172 @@ def heightSplitter():
     line.setStyleSheet(f"color: {BORDER};")
     line.setFixedHeight(2)
     return line
+
+class Rocket3DRotationOrientation(gl.GLViewWidget):
+    STL_PATH = os.path.join(ASSETS_DIRECTORY, "rocket.stl")
+
+    def __init__(self):
+        super().__init__()
+        self.setBackgroundColor('w')
+        self.grid = gl.GLGridItem()
+        self.grid.setColor((150, 150, 150, 255))
+        self.addItem(self.grid)
+        self.setCameraPosition(distance=10)
+        self.rocketScale = 0.01
+
+        self.overlay = QLabel(self)
+        self.overlay.setStyleSheet(
+            "color: white; background-color: rgba(33, 43, 88, 220); "
+            "padding: 8px; font-family: monospace; border-radius: 5px;"
+        )
+        self.overlay.setText("W: --- | X: --- | Y: --- | Z: ---")
+        self.overlay.adjustSize()
+        self._loadRocket()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.overlay.move(10, self.height() - self.overlay.height() - 10)
+
+    def _loadRocket(self):
+        try:
+            stlMesh = mesh.Mesh.from_file(self.STL_PATH)
+            verts = stlMesh.vectors.reshape(-1, 3)
+            centre = (verts.max(axis=0) + verts.min(axis=0)) / 2
+            verts = (verts - centre) * self.rocketScale
+            
+            self.rocket = gl.GLMeshItem(
+                vertexes=verts,
+                faces=np.arange(len(verts)).reshape(-1, 3),
+                smooth=True, 
+                shader='shaded', 
+                color=(0.35, 0.45, 0.85, 1.0)  
+            )
+        except Exception:
+            self.rocket = gl.GLBoxItem(color=(0.35, 0.45, 0.85, 1.0))
+        self.addItem(self.rocket)
+
+    def setRotation(self, w, x, y, z):
+        quat = QQuaternion(w, x, y, z).normalized()
+        transform = QMatrix4x4()
+        transform.rotate(90, 90, 90, 1)
+        transform.rotate(quat)
+        self.rocket.setTransform(transform)
+        self.overlay.setText(f"W: {w:.3f} | X: {x:.3f} | Y: {y:.3f} | Z: {z:.3f}")
+        self.overlay.adjustSize()
+        self.overlay.move(10, self.height() - self.overlay.height() - 10)
+
+class MapWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PAT")
+        self.resize(1280, 800)
+
+        #Main Layout Scaffold
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        base_layout = QHBoxLayout(main_widget)
+        base_layout.setContentsMargins(10, 10, 10, 10)
+        base_layout.setSpacing(10)
+
+        #Left Panel (Telemetry Graphics Dashboard)
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.plot2d_1 = Plot2D("Altitude Profile", "Altitude (m)")
+        self.plot2d_2 = Plot2D("Velocity Track", "Velocity (m/s)")
+        self.plot3d = Plot3D()
+
+        left_layout.addWidget(self.plot2d_1)
+        left_layout.addWidget(self.plot2d_2)
+        left_layout.addWidget(self.plot3d)
+        base_layout.addWidget(left_panel, stretch=1)
+
+        #Right Panel (Geospatial Web Map Frame)
+        self.view = QWebEngineView()
+        self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        base_layout.addWidget(self.view, stretch=2)
+
+        #Mount HTML directly onto local asset server context 
+        self.view.setHtml(HTML, QUrl("http://127.0.0.1:8000/"))
+        self.view.loadFinished.connect(self.handle_load_finished)
+
+        #Data Mechanics Variables
+        self.data = self.load_csv("test_flight_data.csv")
+        self.t = 0.0
+        self.i = 0
+        self.s_lat = None
+        self.s_lon = None
+        self.alpha = 0.1
+
+        self.timer = QTimer()
+        self.timer.setInterval(int(SIM_DT * 1000))
+        self.timer.timeout.connect(self.step)
+
+    def handle_load_finished(self, success):
+        if success:
+            QTimer.singleShot(750, self.start)
+        else:
+            print("Web view failed to reach asset server context")
+
+    def start(self):
+        self.timer.start()
+
+    def load_csv(self, path):
+        data = []
+        if not os.path.exists(path):
+            with open(path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["t", "lat", "lon"])
+                for step in range(300):
+                    writer.writerow([step*0.1, LAUNCH_LAT+(step*0.00003), LAUNCH_LON+(step*0.00005)])
+        
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                data.append((float(r["t"]), float(r["lat"]), float(r["lon"])))
+        return data
+
+    def interpolate(self, t):
+        while self.i < len(self.data) - 2 and self.data[self.i + 1][0] < t:
+            self.i += 1
+
+        t1, lat1, lon1 = self.data[self.i]
+        t2, lat2, lon2 = self.data[self.i + 1]
+        r = (t - t1) / (t2 - t1 + 1e-9)
+        return (lat1 + (lat2 - lat1) * r, lon1 + (lon2 - lon1) * r)
+
+    def step(self):
+        self.t += SIM_DT
+        if self.i >= len(self.data) - 2:
+            self.timer.stop()
+            return
+
+        lat, lon = self.interpolate(self.t)
+
+        if self.s_lat is None:
+            self.s_lat, self.s_lon = lat, lon
+        else:
+            self.s_lat = self.alpha * lat + (1 - self.alpha) * self.s_lat
+            self.s_lon = self.alpha * lon + (1 - self.alpha) * self.s_lon
+
+        # ush coordinate vectors out into the Javascript rendering framework
+        js = f"window.updateMarker({self.s_lat}, {self.s_lon});"
+        self.view.page().runJavaScript(js)
+
+        #Mock values generated to sync standard graph displays dynamically alongside maps
+        self.plot2d_1.times.append(self.t)
+        self.plot2d_1.values.append(math.sin(self.t * 0.2) * 150 + (self.t * 10))
+        self.plot2d_1.updatePlot()
+
+        self.plot2d_2.times.append(self.t)
+        self.plot2d_2.values.append(abs(math.cos(self.t * 0.2) * 45))
+        self.plot2d_2.updatePlot()
+
+        self.plot3d.positionX.append((lon - LAUNCH_LON) * 10000)
+        self.plot3d.positionY.append((lat - LAUNCH_LAT) * 10000)
+        self.plot3d.positionZ.append(math.sin(self.t * 0.2) * 150 + (self.t * 10))
+        self.plot3d.updatePlot()
 
 
 def cardWidget(layout):
@@ -196,19 +544,24 @@ def middle3DColumn(ff):
     column.setContentsMargins(8, 8, 8, 8)
 
     column.addWidget(sectionPillLabel("3D Graph", ff))
-    GraphCombo = QComboBox()
-    GraphCombo.addItems(["Live INS Relative Position (XYZ)"])
-    GraphCombo.setStyleSheet(COMBO_STYLE)
-    column.addWidget(GraphCombo)
+    graphCombo = QComboBox()
+    graphCombo.addItems(["INS Relative Position (XYZ)", "Rocket 3D Rotation"])
+    graphCombo.setStyleSheet(COMBO_STYLE)
+    column.addWidget(graphCombo)
     plot3d = Plot3D()
-    column.addWidget(plot3d, stretch=1)
+    rocket3dOrientation = Rocket3DRotationOrientation()
+    stacked = QStackedWidget()
+    stacked.addWidget(plot3d)
+    stacked.addWidget(rocket3dOrientation)
+    column.addWidget(stacked, stretch=1)
+    graphCombo.currentIndexChanged.connect(stacked.setCurrentIndex)
+
     column.addWidget(heightSplitter())
-
-    #Map
     column.addWidget(sectionPillLabel("Map", ff))
-    column.addWidget(placeHolderBox("Map View", minimumHeight=80), stretch=1)
-    return column, plot3d
+    mapView = QWebEngineView()
+    column.addWidget(mapView, stretch=1)
 
+    return column, plot3d, rocket3dOrientation, mapView
 
 def rightHandSideColumn(ff):
     column = QVBoxLayout()
@@ -226,7 +579,7 @@ def rightHandSideColumn(ff):
     vegaLabel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
     vegaLabel.setMinimumHeight(80)
 
-    rawVideoLabel = QLabel("🎥  Raw Camera Feed\n\n(Load a video to begin)")
+    rawVideoLabel = QLabel("Raw Camera Feed\n\n(Load a video to begin)")
     rawVideoLabel.setAlignment(Qt.AlignCenter)
     rawVideoLabel.setStyleSheet(
         "background-color: #1a1a2e; color: #aab2d0; "
@@ -243,13 +596,13 @@ def rightHandSideColumn(ff):
     column.addWidget(sectionPillLabel("Avionics Status", ff))
     AVIONICS_FIELDS = [
         ("GPS Fix",      "gpsFixMillis",  "ms"),   ("GPS Valid",    "gpsValid",     ""),
-        ("GPS Speed",    "gpsSpeed",      "m/s"),   ("GPS Heading",  "gpsHeading",   "°"),
-        ("Accel X",      "accelX",        "g"),     ("Accel Y",      "accelY",       "g"),
-        ("Accel Z",      "accelZ",        "g"),     ("Gyro X",       "gyroX",        "°/s"),
-        ("Gyro Y",       "gyroY",         "°/s"),   ("Gyro Z",       "gyroZ",        "°/s"),
-        ("Mag X",        "magX",          "raw"),   ("Mag Y",        "magY",         "raw"),
-        ("Mag Z",        "magZ",          "raw"),   ("IMU Temp",     "imuTemp",      "°C"),
-        ("BMP Temp",     "bmpTemp",       "°C"),    ("BMP Pressure", "bmpPressure",  "hPa"),
+        ("GPS Speed",    "gpsSpeed",      "m/s"),  ("GPS Heading",  "gpsHeading",   "°"),
+        ("Accel X",      "accelX",        "g"),    ("Accel Y",      "accelY",       "g"),
+        ("Accel Z",      "accelZ",        "g"),    ("Gyro X",       "gyroX",        "rad/s"),
+        ("Gyro Y",       "gyroY",         "rad/s"),  ("Gyro Z",       "gyroZ",        "rad/s"),
+        ("Mag X",        "magX",          "raw"),  ("Mag Y",        "magY",         "raw"),
+        ("Mag Z",        "magZ",          "raw"),  ("IMU Temp",     "imuTemp",      "°C"),
+        ("BMP Temp",     "bmpTemp",       "°C"),   ("BMP Pressure", "bmpPressure",  "hPa"),
     ]
     avionicsGrid = QGridLayout()
     avionicsGrid.setSpacing(3)
@@ -363,7 +716,6 @@ def avionicsStatusGrid(ff):
     return statusGrid
 
 
-#Main Window
 class PATMainLayout(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -378,18 +730,46 @@ class PATMainLayout(QMainWindow):
         self._build()
 
     def _build(self):
-        titleBanner = QLabel("PAT - Postflight Analysis Tracker  |  LASER - UnityRise - PL-26")
-        titleBanner.setAlignment(Qt.AlignCenter)
-        titleBanner.setFixedHeight(48)
-        titleBanner.setFont(QFont(self.ff, 15, QFont.Weight.Bold))
-        titleBanner.setStyleSheet(
-            f"background-color: {BLUE}; color: white; "
-            f"border-radius: 10px; padding: 5px; letter-spacing: 1px;"
-        )
+        bannerWidget = QWidget()
+        bannerWidget.setFixedHeight(56)
+        bannerWidget.setStyleSheet(f"background-color: {BLUE}; border-radius: 10px;")
+
+        bannerLayout = QHBoxLayout(bannerWidget)
+        bannerLayout.setContentsMargins(10, 4, 10, 4)
+        bannerLayout.setSpacing(8)
+
+        def makeLogo(path, height=44):
+            label = QLabel()
+            pixmap = QPixmap(path)
+            if not pixmap.isNull():
+                label.setPixmap(pixmap.scaledToHeight(height, Qt.SmoothTransformation))
+            label.setAlignment(Qt.AlignVCenter | Qt.AlignHCenter)
+            label.setStyleSheet("background: transparent;")
+            return label
+
+        laserLogo  = makeLogo(os.path.join(ASSETS_DIRECTORY, "LASER_Logo.png"))
+        unityRiseLogo  = makeLogo(os.path.join(ASSETS_DIRECTORY, "unityrise_logo.png"))
+        uolLogo    = makeLogo(os.path.join(ASSETS_DIRECTORY, "uol_logo.png"))
+
+        titleText = QLabel("PAT - Postflight Analysis Tracker  |  Mission Control  |  LASER - UnityRise - PL-26")
+        titleText.setAlignment(Qt.AlignCenter)
+        titleText.setFont(QFont(self.ff, 14, QFont.Weight.Bold))
+        titleText.setStyleSheet("color: white; background: transparent; letter-spacing: 1px;")
+
+        bannerLayout.addWidget(laserLogo)
+        bannerLayout.addWidget(unityRiseLogo)
+        bannerLayout.addStretch()
+        bannerLayout.addWidget(titleText)
+        bannerLayout.addStretch()
+        bannerLayout.addWidget(uolLogo)
 
         leftLayout, self.topCombo, self.topPlot, self.bottomCombo, self.bottomPlot = leftHandSide2DColumn(self.ff)
-        middleLayout, self.plot3d = middle3DColumn(self.ff)
+        middleLayout, self.plot3d, self.rocketWidget, self.mapView = middle3DColumn(self.ff)
         rightLayout, self.avionicsValueLabels, self.vegaLabel, self.rawVideoLabel = rightHandSideColumn(self.ff)
+        
+        # Deploy Leaflet Blueprint inside WebEngine View
+        self.mapView.setHtml(HTML, QUrl("http://127.0.0.1:8000/"))
+
         self.topCombo.currentTextChanged.connect(self.onTopVariableChanged)
         self.bottomCombo.currentTextChanged.connect(self.onBottomVariableChanged)
 
@@ -410,8 +790,7 @@ class PATMainLayout(QMainWindow):
         self.speed     = 1.0
         self.startTime = None
         self.startIndex = 0
-        PLAYBACK_SPEEDS = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
-        self.playbackSpeeds = PLAYBACK_SPEEDS
+        self.playbackSpeeds = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
 
         self.capVega  = None
         self.capRawVideo = None
@@ -433,14 +812,14 @@ class PATMainLayout(QMainWindow):
 
         columns = QHBoxLayout()
         columns.setSpacing(8)
-        columns.addWidget(cardWidget(leftLayout),  stretch=2)
+        columns.addWidget(cardWidget(leftLayout),   stretch=2)
         columns.addWidget(cardWidget(middleLayout),   stretch=2)
         columns.addWidget(cardWidget(rightLayout), stretch=3)
 
         rootLayout = QVBoxLayout()
         rootLayout.setSpacing(6)
         rootLayout.setContentsMargins(10, 8, 10, 8)
-        rootLayout.addWidget(titleBanner)
+        rootLayout.addWidget(bannerWidget)
         rootLayout.addLayout(self.statusStrip)
         rootLayout.addLayout(columns, stretch=1)
         rootLayout.addWidget(playBar)
@@ -502,6 +881,9 @@ class PATMainLayout(QMainWindow):
         self.plot3d.positionX.clear()
         self.plot3d.positionY.clear()
         self.plot3d.positionZ.clear()
+        
+        if hasattr(self, 'mapView') and self.mapView.page():
+            self.mapView.page().runJavaScript("resetMap();")
 
         if self.capVega and self.capVega.isOpened():
             self.capVega.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -521,7 +903,6 @@ class PATMainLayout(QMainWindow):
             self.startTime = time.time()
         self._rebuildHistory(index)
 
-    #Rebuilds data based on playback history
     def _rebuildHistory(self, upToIndex):
         self.topPlot.times.clear()
         self.topPlot.values.clear()
@@ -531,10 +912,11 @@ class PATMainLayout(QMainWindow):
         self.plot3d.positionY.clear()
         self.plot3d.positionZ.clear()
 
-        topDisplay = self.topCombo.currentText()
+        topDisplay    = self.topCombo.currentText()
         bottomDisplay = self.bottomCombo.currentText()
-        timeZero = self.allRows[0]["millis"] / 1000.0 if self.allRows else 0
-        
+        timeZero      = self.allRows[0]["millis"] / 1000.0 if self.allRows else 0
+
+        coords = []
         for row in self.allRows[:upToIndex + 1]:
             t = row["millis"] / 1000.0 - timeZero
             self.topPlot.times.append(t)
@@ -544,11 +926,22 @@ class PATMainLayout(QMainWindow):
             self.plot3d.positionX.append(row.get("accelX", 0))
             self.plot3d.positionY.append(row.get("accelY", 0))
             self.plot3d.positionZ.append(row.get("bmpAltitude", 0))
+            coords.append([row.get("gpsLatitude", 0), row.get("gpsLongitude", 0)])
 
         self.topPlot.updatePlot()
         self.bottomPlot.updatePlot()
         self.plot3d.updatePlot()
-        
+
+        row = self.allRows[upToIndex] if self.allRows else {}
+        self.rocketWidget.setRotation(
+            1.0,
+            row.get("gyroX", 0.0) * 0.005,
+            row.get("gyroY", 0.0) * 0.005,
+            row.get("gyroZ", 0.0) * 0.005
+        )
+
+        self.mapView.page().runJavaScript(f"setPath({coords});")
+
     def playback(self):
         if not self.playing or not self.allRows:
             return
@@ -563,6 +956,7 @@ class PATMainLayout(QMainWindow):
         bottomDisplay = self.bottomCombo.currentText()
         timeZero = self.allRows[0]["millis"] / 1000.0
 
+        new_coords = []
         for i in range(self.playIndex, targetIndex + 1):
             row = self.allRows[i]
             t = row["millis"] / 1000.0 - timeZero
@@ -573,12 +967,13 @@ class PATMainLayout(QMainWindow):
             self.plot3d.positionX.append(row.get("accelX", 0))
             self.plot3d.positionY.append(row.get("accelY", 0))
             self.plot3d.positionZ.append(row.get("bmpAltitude", 0))
+            new_coords.append([row.get("gpsLatitude", 0), row.get("gpsLongitude", 0)])
 
         self.playIndex = targetIndex
         row = self.allRows[self.playIndex]
         t = row["millis"] / 1000.0 - timeZero
 
-        #Update 
+        #Update Text Strips
         self.labelMissionTime.setText(f"Mission Time:  {t:.2f} s")
         self.labelAltitude.setText(f"Altitude: {row.get('bmpAltitude', 0):.1f} m")
         self.labelGPS.setText(f"GPS: {row.get('gpsLatitude', 0):.5f}, {row.get('gpsLongitude', 0):.5f}")
@@ -593,10 +988,22 @@ class PATMainLayout(QMainWindow):
                     label.setText(f"{value:.4f}")
             else:
                 label.setText("---")
+
+        self.rocketWidget.setRotation(
+            1.0,
+            row.get("gyroX", 0.0) * 0.005,
+            row.get("gyroY", 0.0) * 0.005,
+            row.get("gyroZ", 0.0) * 0.005
+        )
+        
         self.topPlot.updatePlot()
         self.bottomPlot.updatePlot()
         if self.playIndex % 5 == 0:
             self.plot3d.updatePlot()
+
+        # Update Map Tracking
+        if new_coords:
+            self.mapView.page().runJavaScript(f"appendPositions({new_coords});")
 
         self.playBackSlider.setValue(self.playIndex)
         self.timeLabel.setText(f"T: {t:.2f} s")
@@ -609,6 +1016,9 @@ class PATMainLayout(QMainWindow):
             self.labelStatus.setText("Status: Complete")
     
     def onLoadVegaVideo(self):
+        if cv2 is None:
+            self.vegaLabel.setText("VEGA Rideshare Feed\n\n(OpenCV is not installed)")
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Open CV Video", BASE_DIRECTORY,
             "Video Files (*.mp4 *.avi *.h264 *.mkv *.mov)"
@@ -622,6 +1032,9 @@ class PATMainLayout(QMainWindow):
             self.vegaLabel.setText("VEGA Rideshare Feed\n\n(Could not open file)")
     
     def onLoadRawVideo(self):
+        if cv2 is None:
+            self.rawVideoLabel.setText("Raw Camera Feed\n\n(OpenCV is not installed)")
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Raw Video", BASE_DIRECTORY,
             "Video Files (*.mp4 *.avi *.h264 *.mkv *.mov)"
@@ -637,9 +1050,9 @@ class PATMainLayout(QMainWindow):
     def onVideoTick(self):
         if not self.playing or not self.allRows:
             return
-        row     = self.allRows[self.playIndex]
-        t       = row["millis"] / 1000.0 - self.allRows[0]["millis"] / 1000.0
-        tTotal  = (self.allRows[-1]["millis"] - self.allRows[0]["millis"]) / 1000.0
+        row = self.allRows[self.playIndex]
+        t = row["millis"] / 1000.0 - self.allRows[0]["millis"] / 1000.0
+        tTotal = (self.allRows[-1]["millis"] - self.allRows[0]["millis"]) / 1000.0
         if tTotal <= 0:
             return
         fraction = t / tTotal
@@ -648,6 +1061,8 @@ class PATMainLayout(QMainWindow):
         self._updateFrame(self.capRawVideo, self.rawVideoLabel, fraction)
 
     def _updateFrame(self, cap, label, fraction):
+        if cv2 is None:
+            return
         if cap is None or not cap.isOpened():
             return
 
@@ -658,12 +1073,9 @@ class PATMainLayout(QMainWindow):
             targetFrame = int(fraction * totalFrames)
             cap.set(cv2.CAP_PROP_POS_FRAMES, targetFrame)
         elif fps > 0:
-            totalDuration = cap.get(cv2.CAP_PROP_POS_AVI_RATIO)
             tTotal = self.allRows[-1]["millis"] / 1000.0 - self.allRows[0]["millis"] / 1000.0
             targetMs = fraction * tTotal * 1000.0
             cap.set(cv2.CAP_PROP_POS_MSEC, targetMs)
-        else:
-            pass
 
         returnValue, frame = cap.read()
         if not returnValue:
@@ -683,6 +1095,11 @@ class PATMainLayout(QMainWindow):
 
 
 if __name__ == "__main__":
+    os.makedirs(TILE_DIR, exist_ok=True)
+    ensure_leaflet_assets()
+    start_tile_server()
+    ensure_tiles()
+    
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     window = PATMainLayout()
